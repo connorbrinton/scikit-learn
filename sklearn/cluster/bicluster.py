@@ -35,10 +35,20 @@ def _scale_normalize(X):
 
     """
     X = make_nonnegative(X)
-    row_diag = np.asarray(1.0 / np.sqrt(X.sum(axis=1))).squeeze()
-    col_diag = np.asarray(1.0 / np.sqrt(X.sum(axis=0))).squeeze()
-    row_diag = np.where(np.isnan(row_diag), 0, row_diag)
-    col_diag = np.where(np.isnan(col_diag), 0, col_diag)
+
+    # Generate "diagonal" matrices of normalized row and column sums
+    row_sums = X.sum(axis=1).squeeze()
+    col_sums = X.sum(axis=0).squeeze()
+    row_diag = np.zeros_like(row_sums)
+    col_diag = np.zeros_like(col_sums)
+
+    # Ignore nans or all-zero columns/rows
+    valid_rows = ~np.isnan(row_sums) & (row_sums != 0)
+    valid_cols = ~np.isnan(col_sums) & (col_sums != 0)
+    np.divide(1.0, np.sqrt(row_sums), where=valid_rows, out=row_diag)
+    np.divide(1.0, np.sqrt(col_sums), where=valid_cols, out=col_diag)
+
+    # Handle sparse matrices
     if issparse(X):
         n_rows, n_cols = X.shape
         r = dia_matrix((row_diag, [0]), shape=(n_rows, n_rows))
@@ -46,6 +56,7 @@ def _scale_normalize(X):
         an = r * X * c
     else:
         an = row_diag[:, np.newaxis] * X * col_diag
+
     return an, row_diag, col_diag
 
 

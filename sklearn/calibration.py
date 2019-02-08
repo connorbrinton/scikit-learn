@@ -17,7 +17,6 @@ import numpy as np
 from scipy.special import expit
 from scipy.special import xlogy
 from scipy.optimize import fmin_bfgs
-from .preprocessing import LabelEncoder
 
 from .base import (BaseEstimator, ClassifierMixin, RegressorMixin, clone,
                    MetaEstimatorMixin)
@@ -100,6 +99,10 @@ class CalibratedClassifierCV(ClassifierMixin,
         split, which has been fitted on training folds and
         calibrated on the testing fold.
 
+    label_binarizer_ : LabelBinarizer object
+        Object used to transform labels to a binary presence matrix and
+        vice-versa.
+
     Examples
     --------
     >>> from sklearn.datasets import make_classification
@@ -168,7 +171,7 @@ class CalibratedClassifierCV(ClassifierMixin,
         X : array-like, shape (n_samples, n_features)
             Training data.
 
-        y : array-like, shape (n_samples,)
+        y : array-like, shape (n_samples,) or (n_samples, n_classes)
             Target values.
 
         sample_weight : array-like of shape (n_samples,), default=None
@@ -181,7 +184,11 @@ class CalibratedClassifierCV(ClassifierMixin,
         """
         X, y = indexable(X, y)
 
-        self.calibrated_classifiers_ = []
+        # Fit LabelBinarizer to targets
+        self.label_binarizer_ = LabelBinarizer().fit(y)
+
+        # Use default base_estimator if none was given (for example,
+        # automated estimator checks use the zero-arg constructor)
         if self.base_estimator is None:
             # we want all classifiers that don't expose a random_state
             # to be deterministic (and we don't want to expose this one).
@@ -189,6 +196,7 @@ class CalibratedClassifierCV(ClassifierMixin,
         else:
             base_estimator = self.base_estimator
 
+        self.calibrated_classifiers_ = []
         if self.cv == "prefit":
             # Set `n_features_in_` attribute
             if isinstance(self.base_estimator, Pipeline):
@@ -200,16 +208,22 @@ class CalibratedClassifierCV(ClassifierMixin,
             self.classes_ = self.base_estimator.classes_
 
             calibrated_classifier = _CalibratedClassifier(
-                base_estimator, method=self.method)
+                base_estimator,
+                binarizer=self.label_binarizer_,
+                method=self.method,
+            )
             calibrated_classifier.fit(X, y, sample_weight)
             self.calibrated_classifiers_.append(calibrated_classifier)
         else:
+            # Validate input arguments
             X, y = self._validate_data(
                 X, y, accept_sparse=['csc', 'csr', 'coo'],
-                force_all_finite=False, allow_nd=True
+                force_all_finite=False, allow_nd=True, dtype=None,
+                ensure_2d=False, multi_output=True
             )
-            le = LabelBinarizer().fit(y)
-            self.classes_ = le.classes_
+
+            # Use label binarizer classes as classes_
+            self.classes_ = self.label_binarizer_.classes_
 
             # Check that each cross-validation fold can have at least one
             # example per class
@@ -248,7 +262,10 @@ class CalibratedClassifierCV(ClassifierMixin,
                     this_estimator.fit(X[train], y[train])
 
                 calibrated_classifier = _CalibratedClassifier(
-                    this_estimator, method=self.method, classes=self.classes_)
+                    this_estimator,
+                    binarizer=self.label_binarizer_,
+                    method=self.method,
+                )
                 sw = None if sample_weight is None else sample_weight[test]
                 calibrated_classifier.fit(X[test], y[test], sample_weight=sw)
                 self.calibrated_classifiers_.append(calibrated_classifier)
@@ -271,15 +288,16 @@ class CalibratedClassifierCV(ClassifierMixin,
         C : array, shape (n_samples, n_classes)
             The predicted probas.
         """
-        check_is_fitted(self)
+        check_is_fitted(self, ["classes_", "calibrated_classifiers_"])
         X = check_array(X, accept_sparse=['csc', 'csr', 'coo'],
-                        force_all_finite=False)
+                        force_all_finite=False, allow_nd=True, dtype=None,
+                        ensure_2d=False)
+
         # Compute the arithmetic mean of the predictions of the calibrated
         # classifiers
-        mean_proba = np.zeros((X.shape[0], len(self.classes_)))
-        for calibrated_classifier in self.calibrated_classifiers_:
-            proba = calibrated_classifier.predict_proba(X)
-            mean_proba += proba
+        mean_proba = self.calibrated_classifiers_[0].predict_proba(X)
+        for calibrated_classifier in self.calibrated_classifiers_[1:]:
+            mean_proba += calibrated_classifier.predict_proba(X)
 
         mean_proba /= len(self.calibrated_classifiers_)
 
@@ -300,8 +318,16 @@ class CalibratedClassifierCV(ClassifierMixin,
         C : array, shape (n_samples,)
             The predicted class.
         """
-        check_is_fitted(self)
-        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+        check_is_fitted(self, ["classes_", "calibrated_classifiers_"])
+
+        # Obtain predicted probabilities
+        probs = self.predict_proba(X)
+
+        # Invert them (multi-label case handled by LabelBinarizer)
+        predictions = self.label_binarizer_.inverse_transform(probs,
+                                                              threshold=0.5)
+
+        return predictions
 
     def _more_tags(self):
         return {
@@ -327,15 +353,14 @@ class _CalibratedClassifier:
         to offer more accurate predict_proba outputs. No default value since
         it has to be an already fitted estimator.
 
+    binarizer : fitted LabelBinarizer instance, optional
+        :class:~sklearn.preprocessing.LabelBinarizer` instance used to binarize
+        labels for the calibration algorithm.
+
     method : 'sigmoid' | 'isotonic'
         The method to use for calibration. Can be 'sigmoid' which
         corresponds to Platt's method or 'isotonic' which is a
         non-parametric approach based on isotonic regression.
-
-    classes : array-like, shape (n_classes,), optional
-            Contains unique classes used to fit the base estimator.
-            if None, then classes is extracted from the given target values
-            in fit().
 
     See also
     --------
@@ -356,29 +381,62 @@ class _CalibratedClassifier:
            A. Niculescu-Mizil & R. Caruana, ICML 2005
     """
     @_deprecate_positional_args
-    def __init__(self, base_estimator, *, method='sigmoid', classes=None):
+    def __init__(self, base_estimator, *, binarizer=None, method='sigmoid'):
         self.base_estimator = base_estimator
+        self.binarizer = binarizer
         self.method = method
-        self.classes = classes
 
-    def _preproc(self, X):
-        n_classes = len(self.classes_)
+    @property
+    def classes(self):
+        return self.binarizer.classes_
+
+    @property
+    def y_type(self):
+        return self.binarizer.y_type_
+
+    def _get_uncalibrated_estimates(self, X):
+        """
+        Obtain uncalibrated class membership estimates for ``X``
+
+        Retrieves class membership estimates using by calling either
+        ``decision_function`` or ``predict_proba`` on the base estimator,
+        preferring the first.
+
+        If this classifier is trained on binary data, this method will return
+        an array of shape ``(n_samples, 1)`` representing class membership
+        estimates for the positive class. For all other classification problem
+        types, an array of shape ``(n_samples, n_classes)`` is returned. This
+        is consistent with the return value of :func:`label_binarize` for the
+        target data.
+        """
+        # Extract estimates from estimator
         if hasattr(self.base_estimator, "decision_function"):
-            df = self.base_estimator.decision_function(X)
-            if df.ndim == 1:
-                df = df[:, np.newaxis]
+            estimates = self.base_estimator.decision_function(X)
         elif hasattr(self.base_estimator, "predict_proba"):
-            df = self.base_estimator.predict_proba(X)
-            if n_classes == 2:
-                df = df[:, 1:]
+            estimates = self.base_estimator.predict_proba(X)
         else:
             raise RuntimeError('classifier has no decision_function or '
                                'predict_proba method.')
 
-        idx_pos_class = self.label_encoder_.\
-            transform(self.base_estimator.classes_)
+        # For binary problems, reduce to positive class (like label_binarize)
+        if self.y_type == 'binary':
+            if estimates.ndim == 1:
+                estimates = estimates[:, np.newaxis]
+            if estimates.shape[1] == 2:
+                estimates = estimates[:, [1]]
 
-        return df, idx_pos_class
+        # Check that the classifier is making estimates for every class
+        expected_column_count = 1 if self.y_type == 'binary' \
+            else len(self.classes)
+        if expected_column_count != estimates.shape[1]:
+            raise ValueError(
+                "Expected base estimator's decision_function or predict_proba"
+                f" method to return {expected_column_count} columns, found"
+                f" {estimates.shape[1]} columns. Does each CV fold include"
+                " every label?"
+            )
+
+        return estimates
 
     def fit(self, X, y, sample_weight=None):
         """Calibrate the fitted model
@@ -388,7 +446,7 @@ class _CalibratedClassifier:
         X : array-like, shape (n_samples, n_features)
             Training data.
 
-        y : array-like, shape (n_samples,)
+        y : array-like, shape (n_samples,) or (n_samples, n_classes)
             Target values.
 
         sample_weight : array-like of shape (n_samples,), default=None
@@ -399,20 +457,21 @@ class _CalibratedClassifier:
         self : object
             Returns an instance of self.
         """
+        # Fit binarizer if necessary
+        if not self.binarizer:
+            self.binarizer = LabelBinarizer().fit(y)
 
-        self.label_encoder_ = LabelEncoder()
-        if self.classes is None:
-            self.label_encoder_.fit(y)
-        else:
-            self.label_encoder_.fit(self.classes)
+        # Binarize labels
+        # For binary classification result has shape (n_samples, 1)
+        # For other kinds of classification, has shape (n_samples, n_classes)
+        Y = self.binarizer.transform(y)
 
-        self.classes_ = self.label_encoder_.classes_
-        Y = label_binarize(y, classes=self.classes_)
+        # Obtain base estimator predictions
+        estimates = self._get_uncalibrated_estimates(X)
 
-        df, idx_pos_class = self._preproc(X)
+        # Calibrate predictions for each class
         self.calibrators_ = []
-
-        for k, this_df in zip(idx_pos_class, df.T):
+        for class_estimates, class_true_binary in zip(estimates.T, Y.T):
             if self.method == 'isotonic':
                 calibrator = IsotonicRegression(out_of_bounds='clip')
             elif self.method == 'sigmoid':
@@ -420,7 +479,9 @@ class _CalibratedClassifier:
             else:
                 raise ValueError('method should be "sigmoid" or '
                                  '"isotonic". Got %s.' % self.method)
-            calibrator.fit(this_df, Y[:, k], sample_weight)
+
+            # Fit and store the calibrator
+            calibrator.fit(class_estimates, class_true_binary, sample_weight)
             self.calibrators_.append(calibrator)
 
         return self
@@ -441,25 +502,23 @@ class _CalibratedClassifier:
         C : array, shape (n_samples, n_classes)
             The predicted probas. Can be exact zeros.
         """
-        n_classes = len(self.classes_)
-        proba = np.zeros((X.shape[0], n_classes))
+        # Obtain base estimator estimates
+        estimates = self._get_uncalibrated_estimates(X)
 
-        df, idx_pos_class = self._preproc(X)
+        # Calibrate estimates by class
+        proba = np.empty_like(estimates)
+        for class_index, class_estimates in enumerate(estimates.T):
+            calibrator = self.calibrators_[class_index]
+            proba[:, class_index] = calibrator.predict(class_estimates)
 
-        for k, this_df, calibrator in \
-                zip(idx_pos_class, df.T, self.calibrators_):
-            if n_classes == 2:
-                k += 1
-            proba[:, k] = calibrator.predict(this_df)
-
-        # Normalize the probabilities
-        if n_classes == 2:
-            proba[:, 0] = 1. - proba[:, 1]
-        else:
-            proba /= np.sum(proba, axis=1)[:, np.newaxis]
-
-        # XXX : for some reason all probas can be 0
-        proba[np.isnan(proba)] = 1. / n_classes
+        # Handle return type conversion for target type
+        if self.y_type == 'binary' and proba.shape[1] == 1:
+            # Convert to (n_samples, 2) for binary problems
+            proba = np.hstack((1 - proba, proba))
+        elif not self.y_type.startswith('multilabel'):
+            # Normalize probabilities since each sample has only one label
+            proba_sums = np.sum(proba, axis=1, keepdims=True)
+            np.divide(proba, proba_sums, out=proba, where=(proba_sums != 0))
 
         # Deal with cases where the predicted probability minimally exceeds 1.0
         proba[(1.0 < proba) & (proba <= 1.0 + 1e-5)] = 1.0

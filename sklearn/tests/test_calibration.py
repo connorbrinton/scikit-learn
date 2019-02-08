@@ -18,8 +18,10 @@ from sklearn.preprocessing import LabelBinarizer
 from sklearn.model_selection import KFold
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
 from sklearn.feature_extraction import DictVectorizer
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import brier_score_loss, log_loss
@@ -305,6 +307,10 @@ def test_calibration_curve():
     assert_raises(ValueError, calibration_curve, y_true2, y_pred2,
                   strategy='percentile')
 
+    # Check that error is raised when non-binary input passed
+    y_true_nonbinary = np.array([0, 0, 0, 1, 1, 2])
+    assert_raises(ValueError, calibration_curve, y_true_nonbinary, y_pred)
+
 
 def test_calibration_nan_imputer():
     """Test that calibration can accept nan"""
@@ -325,9 +331,8 @@ def test_calibration_prob_sum():
     # issue #7796
     num_classes = 2
     X, y = make_classification(n_samples=10, n_features=5,
-                               n_classes=num_classes)
-    clf = LinearSVC(C=1.0)
-    clf_prob = CalibratedClassifierCV(clf, method="sigmoid", cv=LeaveOneOut())
+                               n_classes=num_classes, random_state=42)
+    clf_prob = CalibratedClassifierCV(method="sigmoid", cv=LeaveOneOut())
     clf_prob.fit(X, y)
 
     probs = clf_prob.predict_proba(X)
@@ -335,22 +340,35 @@ def test_calibration_prob_sum():
 
 
 def test_calibration_less_classes():
-    # Test to check calibration works fine when train set in a test-train
-    # split does not contain all classes
+    # Test to check an error is raised when a classifier does not return the
+    # appropriate number of estimates
     # Since this test uses LOO, at each iteration train set will not contain a
-    # class label
+    # class label. This means that LinearSVC won't know to return an estimate
+    # for that class.
     X = np.random.randn(10, 5)
     y = np.arange(10)
     clf = LinearSVC(C=1.0)
     cal_clf = CalibratedClassifierCV(clf, method="sigmoid", cv=LeaveOneOut())
+
+    assert_raises(ValueError, cal_clf.fit, X, y)
+
+
+def test_calibration_text_input():
+    """Test calibration of a classifier accepting 1D input"""
+    X = ["apple", "apple", "pear", "pear"]
+    y = [1, 1, 0, 0]
+    pipeline = Pipeline([
+        ('vectorizer', TfidfVectorizer()),
+        ('classifier', LinearSVC())
+    ])
+    cal_clf = CalibratedClassifierCV(pipeline, method="sigmoid", cv=2)
     cal_clf.fit(X, y)
 
     for i, calibrated_classifier in \
             enumerate(cal_clf.calibrated_classifiers_):
         proba = calibrated_classifier.predict_proba(X)
-        assert_array_equal(proba[:, i], np.zeros(len(y)))
-        assert np.all(np.hstack([proba[:, :i],
-                                 proba[:, i + 1:]]))
+        assert proba.shape == (len(y), 2)
+        assert np.all(proba >= 0) and np.all(proba <= 1)
 
 
 @ignore_warnings(category=FutureWarning)
@@ -432,3 +450,37 @@ def test_calibration_attributes(clf, cv):
         classes = LabelBinarizer().fit(y).classes_
         assert_array_equal(calib_clf.classes_, classes)
         assert calib_clf.n_features_in_ == X.shape[1]
+
+
+def test_calibration_multilabel():
+    """Test calibration on a multilabel classification problem"""
+    # Make a classification problem
+    X = 10 * [
+        [0, 0],
+        [1, 0],
+        [0, 1],
+        [1, 1],
+    ]
+    y = 10 * [
+        [0, 0],
+        [1, 0],
+        [0, 1],
+        [1, 1],
+    ]
+
+    # Fit calibrated classifier to data
+    clf = OneVsRestClassifier(LinearSVC(C=1.0, random_state=42))
+    clf_prob = CalibratedClassifierCV(clf, method="sigmoid", cv=2)
+    clf_prob.fit(X, y)
+
+    # Verify that multiple labels for each sample can have high probability
+    probs = clf_prob.predict_proba([[1, 1]])
+    assert np.sum(probs) > 1.5
+
+    # Verify that when there should be just one label it's close to 1.0 though
+    probs = clf_prob.predict_proba([[1, 0]])
+    assert np.isclose(np.sum(probs), 1)
+
+    # And when there should be no label, it will have a low estimate for both
+    probs = clf_prob.predict_proba([[0, 0]])
+    assert np.sum(probs) < 0.5
